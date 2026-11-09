@@ -8,8 +8,7 @@
 
 BASE=https://raw.githubusercontent.com/delormemsc/almond3s-lcd/main
 BOARD=securifi,almond-3s
-RELEASE=24.10.5
-KERNEL=6.6.119
+KERNEL=$(uname -r)
 TMPD=/tmp/almond-lcd-install
 KO=/lib/modules/$KERNEL/almond_lcd.ko
 CRON='* * * * * /usr/bin/almond-lcd-collect >/dev/null 2>&1'
@@ -23,8 +22,10 @@ check() {
 	. /etc/openwrt_release
 	b=$(cat /tmp/sysinfo/board_name 2>/dev/null)
 	[ "$b" = "$BOARD" ] || die "board is '$b', this works only on $BOARD"
-	[ "$DISTRIB_RELEASE" = "$RELEASE" ] || die "OpenWrt is $DISTRIB_RELEASE, supported: $RELEASE"
-	[ "$(uname -r)" = "$KERNEL" ] || die "kernel is $(uname -r), the module is built for $KERNEL"
+	case "$DISTRIB_RELEASE" in
+		24.10.*|25.12.*) ;;
+		*) die "OpenWrt is $DISTRIB_RELEASE, supported: 24.10.x and 25.12.x" ;;
+	esac
 	for c in flock sha256sum ping wget; do
 		command -v "$c" >/dev/null 2>&1 || die "'$c' is missing"
 	done
@@ -36,7 +37,7 @@ check() {
 get() { # <path in the repository>
 	mkdir -p "$(dirname "$TMPD/$1")"
 	wget -q -O "$TMPD/$1" "$BASE/$1" ||
-		die "cannot download $1 (try: opkg update && opkg install ca-bundle libustream-mbedtls)"
+		die "cannot download $1 (HTTPS needs the ca-bundle and libustream packages)"
 }
 
 put() { # <path in the repository> <target> <mode>
@@ -55,15 +56,19 @@ install_all() {
 	check
 	rm -rf "$TMPD"
 	get SHA256SUMS
-	for f in dist/almond_lcd.ko dist/almond-lcd-status dist/almond-lcd-at \
-		 files/almond-lcd-collect files/almond-lcd-modem files/almond-lcd.init; do
+	MOD=dist/kmod/$KERNEL/almond_lcd.ko
+	grep -q "  $MOD\$" "$TMPD/SHA256SUMS" || die "no module for kernel $KERNEL in this repository"
+	FILES="$MOD dist/almond-lcd-status dist/almond-lcd-at files/almond-lcd-collect files/almond-lcd-modem files/almond-lcd.init"
+	: > "$TMPD/want"
+	for f in $FILES; do
 		get "$f"
+		grep "  $f\$" "$TMPD/SHA256SUMS" >> "$TMPD/want" || die "$f is not in SHA256SUMS"
 	done
-	(cd "$TMPD" && sha256sum -c SHA256SUMS >/dev/null 2>&1) || die "checksum mismatch"
+	(cd "$TMPD" && sha256sum -c want >/dev/null 2>&1) || die "checksum mismatch"
 
 	[ -x /etc/init.d/almond-lcd ] && /etc/init.d/almond-lcd stop 2>/dev/null
 	mkdir -p "/lib/modules/$KERNEL"
-	put dist/almond_lcd.ko "$KO" 644
+	put "$MOD" "$KO" 644
 	put dist/almond-lcd-status /usr/bin/almond-lcd-status 755
 	put files/almond-lcd-collect /usr/bin/almond-lcd-collect 755
 	put files/almond-lcd.init /etc/init.d/almond-lcd 755
@@ -105,7 +110,7 @@ install_all() {
 uninstall_all() {
 	[ -x /etc/init.d/almond-lcd ] && { /etc/init.d/almond-lcd stop 2>/dev/null; /etc/init.d/almond-lcd disable 2>/dev/null; }
 	grep -q '^almond_lcd ' /proc/modules && rmmod almond_lcd
-	rm -f "$KO" /usr/bin/almond-lcd-status /usr/bin/almond-lcd-collect /usr/bin/almond-lcd-at \
+	rm -f /lib/modules/*/almond_lcd.ko /usr/bin/almond-lcd-status /usr/bin/almond-lcd-collect /usr/bin/almond-lcd-at \
 	      /usr/bin/almond-lcd-modem /etc/init.d/almond-lcd /etc/almond-lcd.theme
 	if [ -f /etc/crontabs/root ]; then
 		sed -i '/almond-lcd-collect/d' /etc/crontabs/root
