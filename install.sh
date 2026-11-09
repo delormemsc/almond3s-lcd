@@ -34,7 +34,7 @@ check() {
 }
 
 get() { # <path in the repository>
-	mkdir -p "$TMPD/${1%/*}"
+	mkdir -p "$(dirname "$TMPD/$1")"
 	wget -q -O "$TMPD/$1" "$BASE/$1" ||
 		die "cannot download $1 (try: opkg update && opkg install ca-bundle libustream-mbedtls)"
 }
