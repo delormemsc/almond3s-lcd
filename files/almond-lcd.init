@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+# Экран состояния Almond 3S: модуль almond_lcd + almond-lcd-status.
+START=99
+STOP=10
+USE_PROCD=1
+
+LED=/sys/class/leds/display:power/brightness
+
+start_service() {
+	[ -c /dev/lcd ] || insmod almond_lcd || return 1
+	[ -w "$LED" ] && echo 1 > "$LED"
+	/usr/bin/almond-lcd-collect >/dev/null 2>&1 &
+	procd_open_instance
+	procd_set_param command /usr/bin/almond-lcd-status wan
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+	# данные встроенного модема раз в 5 с, если он есть
+	if [ -x /usr/bin/almond-lcd-modem ]; then
+		procd_open_instance m2
+		procd_set_param command /usr/bin/almond-lcd-modem stream
+		procd_set_param respawn 3600 5 0
+		procd_close_instance
+	fi
+}
+
+stop_service() {
+	[ -w "$LED" ] && echo 0 > "$LED"
+}

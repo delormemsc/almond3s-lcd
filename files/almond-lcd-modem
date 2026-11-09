@@ -1,0 +1,126 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Данные встроенного модема (Quectel EC21) для экрана almond-lcd.
+# Опрашивает модем по AT через almond-lcd-at (только запросы состояния, ничего не
+# меняет) и пишет /tmp/almond-lcd.m2 в том же виде КЛЮЧ="значение", что и
+# ожидает экран, плюс свои ключи: SRC=builtin, MODEL, FW, SIM, REG,
+# BAND, MCCMNC, LAC, CELLID, ARFCN, RSSI. Файл пишется рядом и переносится целиком.
+#   almond-lcd-modem          один вывод (сборщик раз в минуту, если поток стоит)
+#   almond-lcd-modem stream   раз в 5 с; через час выход, procd запустит заново
+# Порт: запасной AT-порт ttyUSB3 (ttyUSB2 основной, его занимает ModemManager).
+DEV=${LCD_AT_DEV:-/dev/ttyUSB3}
+AT=/usr/bin/almond-lcd-at
+M=/tmp/almond-lcd.m2
+FW_CACHE=/tmp/almond-lcd.modem-fw
+
+oper() {
+	case "$1" in
+		25001) echo MTS ;; 25002) echo MegaFon ;; 25020) echo Tele2 ;;
+		25099) echo beeline ;; 25011) echo Yota ;; "") echo "" ;; *) echo "$1" ;;
+	esac
+}
+# диапазон GSM/LTE словом по номеру канала или полосы
+gsm_band() { [ "$1" -ge 512 ] && [ "$1" -le 885 ] && echo DCS1800 || echo GSM900; }
+lte_bw() { case "$1" in 0) echo 1.4 ;; 1) echo 3 ;; 2) echo 5 ;; 3) echo 10 ;; 4) echo 15 ;; 5) echo 20 ;; *) echo "" ;; esac; }
+reg_word() { # <stat> из CREG/CEREG, <state> из QENG
+	case "$2" in LIMSRV) echo "LIMITED SERVICE"; return ;; esac
+	case "$1" in
+		1) echo REGISTERED ;; 5) echo ROAMING ;; 2) echo SEARCHING ;; 3) echo DENIED ;;
+		0) echo "NOT REGISTERED" ;; 4) echo UNKNOWN ;; *) echo "" ;;
+	esac
+}
+
+snap() {
+	# прошивка и модель спрашиваем один раз
+	if [ ! -s "$FW_CACHE" ]; then
+		$AT "$DEV" ATE0 AT+CGMR 2>/dev/null | grep -E '^[A-Z0-9]{8,}$' | head -n 1 > "$FW_CACHE"
+	fi
+	out=$($AT "$DEV" 'AT+QSIMSTAT?' 'AT+CSQ' 'AT+QNWINFO' 'AT+QENG="servingcell"' 'AT+CEREG?' 'AT+CREG?' 'AT+QTEMP' 2>/dev/null)
+	[ -n "$out" ] || return 1
+	echo "$out" | grep -q -E '^(\+|OK)' || return 1
+	g() { echo "$out" | sed -n "s/^$1: *//p" | head -n 1; }
+
+	sim=$(g '+QSIMSTAT' | cut -d, -f2 | tr -dc 0-9)
+	csq=$(g '+CSQ' | cut -d, -f1 | tr -dc 0-9)
+	rssi=; [ -n "$csq" ] && [ "$csq" != 99 ] && rssi=$((-113 + 2 * csq))
+	nw=$(g '+QNWINFO' | tr -d '"')			# GSM,25001,CDMA BC0,860
+	mode=$(echo "$nw" | cut -d, -f1); mccmnc=$(echo "$nw" | cut -d, -f2); chan=$(echo "$nw" | cut -d, -f4 | tr -dc 0-9)
+	[ "$mode" = "NOSERVICE" ] || [ -z "$mode" ] && mode=${mode:-NO SERVICE}
+	cereg=$(g '+CEREG' | cut -d, -f2 | tr -dc 0-9); creg=$(g '+CREG' | cut -d, -f2 | tr -dc 0-9)
+	temp=$(g '+QTEMP' | cut -d, -f1 | tr -dc 0-9-)
+	eng=$(g '+QENG' | tr -d '"')			# servingcell,LIMSRV,GSM,250,01,197,82A3,60,860,0,-83,...
+	state=$(echo "$eng" | cut -d, -f2); act=$(echo "$eng" | cut -d, -f3)
+	rscp=; ecio=-; sinr=-; pci=-; lband=; band=; lac=; cellid=; cid=; arfcn=$chan
+	case "$act" in
+	LTE)	# ...,LTE,FDD,MCC,MNC,cellID,PCID,earfcn,band,UL_bw,DL_bw,TAC,RSRP,RSRQ,RSSI,SINR,srxlev
+		set -- $(echo "$eng" | tr ',' ' ')
+		cellhex=$6; pci=$7; arfcn=$8; bandn=$9; dlbw=$(lte_bw "${11}"); tachex=${12}
+		rscp=${13}; ecio=${14}; [ -n "${15}" ] && rssi=${15}
+		sinr=$(( ${16:-0} )); sinr=$(awk "BEGIN{printf \"%.1f\", $sinr/5-20}")
+		band="B$bandn"; lband="B$bandn (Bandwidth: $dlbw MHz)"
+		celldec=$(printf '%d' "0x$cellhex" 2>/dev/null); cid="Long $cellhex ($celldec)"
+		lac=$(printf '%d' "0x$tachex" 2>/dev/null); cellid=$celldec
+		reg=$(reg_word "$cereg" "$state") ;;
+	WCDMA)	# ...,WCDMA,MCC,MNC,LAC,cellID,uarfcn,PSC,RAC,RSCP,ECIO,...
+		set -- $(echo "$eng" | tr ',' ' ')
+		lac=$(printf '%d' "0x$6" 2>/dev/null); cellid=$(printf '%d' "0x$7" 2>/dev/null); arfcn=$8
+		rscp=${11}; ecio=${12}; band=WCDMA
+		reg=$(reg_word "$creg" "$state") ;;
+	GSM)	# ...,GSM,MCC,MNC,LAC,cellID,bsic,arfcn,band,rxlev,...
+		set -- $(echo "$eng" | tr ',' ' ')
+		lac=$(printf '%d' "0x$6" 2>/dev/null); cellid=$(printf '%d' "0x$7" 2>/dev/null); arfcn=$9
+		rscp=${11}; band=$(gsm_band "${arfcn:-0}")
+		reg=$(reg_word "$creg" "$state") ;;
+	*)	reg=$(reg_word "${cereg:-$creg}" "$state") ;;
+	esac
+	[ -n "$rscp" ] || rscp=${rssi:--}
+
+	# подключение по модему: интерфейс modem (qmi, wwan0) этого же роутера
+	j=$(ubus call network.interface.modem status 2>/dev/null)
+	wup=0; wupt=; wip=; wdev=wwan0
+	[ -n "$j" ] && eval "$(jsonfilter -s "$j" -e 'wup=@.up' -e 'wupt=@.uptime' -e 'wip=@["ipv4-address"][0].address' -e 'wdev=@.l3_device' 2>/dev/null)"
+	[ "$wup" = true ] && wup=1; [ "$wup" = false ] && wup=0
+	read -r up _ < /proc/uptime
+	now=$(date +%s)
+	{
+		echo "SRC=builtin"
+		echo "MODEL=\"QUECTEL EC21\""
+		echo "FW=\"$(cat "$FW_CACHE" 2>/dev/null)\""
+		echo "SIM=${sim:--}"
+		echo "REG=\"$reg\""
+		echo "MODE=\"$mode\""
+		echo "COPS=\"$(oper "$mccmnc")\""
+		echo "MCCMNC=\"$mccmnc\""
+		echo "BAND=\"$band\""
+		[ -n "$lband" ] && echo "LBAND=\"$lband\""
+		echo "ARFCN=${arfcn:--}"
+		echo "RSSI=\"${rssi:--}\""
+		echo "RSCP=\"$rscp\""
+		echo "ECIO=\"$ecio\""
+		echo "SINR=\"$sinr\""
+		echo "PCI=\"$pci\""
+		[ -n "$cid" ] && echo "CID=\"$cid\""
+		echo "LAC=${lac:--}"
+		echo "CELLID=${cellid:--}"
+		echo "TEMP=\"${temp:--}\""
+		echo "UPTIME=$up"
+		echo "WAN_UP=$wup"
+		echo "WAN_UPTIME=$wupt"
+		echo "WAN_IP=\"$wip\""
+		echo "WAN_DEV=$wdev"
+		[ -d "/sys/class/net/$wdev" ] && echo "WAN_RX=$(cat /sys/class/net/$wdev/statistics/rx_bytes)" && echo "WAN_TX=$(cat /sys/class/net/$wdev/statistics/tx_bytes)"
+		echo "MTIME=$now"
+		echo "NOW=$now"
+	} > "$M.new" && mv -f "$M.new" "$M"
+}
+
+if [ "$1" = stream ]; then
+	n=0
+	while [ $n -lt 720 ]; do
+		snap || { : > "$M.new"; mv -f "$M.new" "$M"; }	# модем молчит - файл пустой, экран покажет MODEM DOWN
+		n=$((n + 1))
+		sleep 5
+	done
+else
+	snap || { : > "$M.new"; mv -f "$M.new" "$M"; }
+fi

@@ -1,0 +1,12 @@
+Almond 3S LCD
+Copyright (C) 2026 Andrey Delorme <https://github.com/delormemsc>
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 2 only (see LICENSE).
+When redistributing this project or a work based on it, keep this notice
+and credit the author with a link to
+https://github.com/delormemsc/almond3s-lcd
+
+The anti-aliased font data in src/font_aa.h is generated from JetBrains Mono,
+Copyright 2020 The JetBrains Mono Project Authors, licensed under the
+SIL Open Font License 1.1 (see LICENSES/OFL-1.1.txt).

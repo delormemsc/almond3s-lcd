@@ -1,0 +1,106 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Медленные проверки для экрана almond-lcd, cron раз в минуту.
+# Пишет /tmp/almond-lcd.status (key=value), almond-lcd-status его читает.
+OUT=/tmp/almond-lcd.status
+TMP=$OUT.$$
+
+# запуски не накладываются: долгий запуск пропускает следующий тик
+exec 9>/var/lock/almond-lcd-collect.lock
+flock -n 9 || exit 0
+
+now=$(date +%s)
+
+# podkop необязателен: без него индикаторы VPN скрыты и внешние сервисы не опрашиваются
+podkop=0; podkop_table=; guard=ok
+vpn_ip=; vpn_cc=; fakeip=0; vpn_ok_age=
+if [ -x /usr/bin/podkop ]; then
+	podkop=1
+	# та же проверка, что «FakeIP» в диагностике podkop, до 3 попыток
+	for i in 1 2 3; do
+		j=$(curl -s -m 6 https://fakeip.podkop.fyi/check 2>/dev/null)
+		ip=$(echo "$j" | jsonfilter -e '@.IP' 2>/dev/null)
+		if [ -n "$ip" ]; then
+			vpn_ip=$ip
+			[ "$(echo "$j" | jsonfilter -e '@.fakeip' 2>/dev/null)" = true ] && fakeip=1
+			break
+		fi
+	done
+	# экран желтеет, только если удачной проверки не было дольше 3 минут
+	OKF=/tmp/almond-lcd.vpnok
+	[ "$fakeip" = 1 ] && echo "$now $vpn_ip" > "$OKF"
+	okts=; okip=
+	[ -f "$OKF" ] && read -r okts okip < "$OKF"
+	[ -n "$okts" ] && vpn_ok_age=$((now - okts))
+	[ -z "$vpn_ip" ] && vpn_ip=$okip
+
+	# страна выхода: один запрос на каждый новый IP, при неудаче не чаще раза в час
+	CCF=/tmp/almond-lcd.cc
+	ccip=; ccts=0
+	[ -f "$CCF" ] && read -r ccip vpn_cc ccts < "$CCF"
+	if [ -n "$vpn_ip" ] && { [ "$ccip" != "$vpn_ip" ] || { [ "$vpn_cc" = - ] && [ $((now - ccts)) -ge 3600 ]; }; }; then
+		vpn_cc=$(curl -s -m 6 "https://ipinfo.io/$vpn_ip/country" 2>/dev/null | tr -d '\r\n ')
+		echo "$vpn_cc" | grep -qE '^[A-Z]{2}$' || vpn_cc=-
+		echo "$vpn_ip $vpn_cc $now" > "$CCF"
+	fi
+	[ -z "$vpn_ip" ] && vpn_cc=
+	[ "$vpn_cc" = - ] && vpn_cc=
+
+	# таблица podkop в nftables на месте
+	nft list table inet PodkopTable >/dev/null 2>&1 && podkop_table=1 || podkop_table=0
+fi
+
+ping_ms=$(ping -c 2 -W 3 8.8.8.8 2>/dev/null | awk -F/ '/min\/avg\/max/ {printf "%d", $4}')
+
+# встроенный модем: файл пишет almond-lcd-modem по AT; если поток стоит дольше 20 с, спросить самим
+M=/tmp/almond-lcd.m2
+MODEM_LOCAL=/usr/bin/almond-lcd-modem
+modem=0; modem_ping=; lte_ok=0
+lte_mode=; lte_rsrp=; lte_rsrq=; lte_sinr=; lte_temp=; lte_bands=; lte_age=; lte_sim=
+if [ -x "$MODEM_LOCAL" ]; then
+	modem=1
+	age=$(( $(date +%s) - $(date -r "$M" +%s 2>/dev/null || echo 0) ))
+	if [ "$age" -gt 20 ]; then
+		"$MODEM_LOCAL" >/dev/null 2>&1 &
+		P=$!
+		( sleep 10; kill "$P" 2>/dev/null ) &
+		WD=$!
+		wait "$P" 2>/dev/null
+		kill "$WD" 2>/dev/null
+	fi
+	v() { sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$M" 2>/dev/null | head -n 1; }
+	lte_mode=$(v MODE)
+	lte_rsrp=$(v RSCP | grep -oE '^-?[0-9]+')
+	lte_rsrq=$(v ECIO | grep -oE '^-?[0-9.]+')
+	lte_sinr=$(v SINR | grep -oE '^-?[0-9.]+')
+	lte_temp=$(v TEMP | grep -oE '^-?[0-9]+')
+	lte_bands=$(v LBAND | grep -oE 'B[0-9]+' | tr '\n' '+' | sed 's/+$//')
+	mt=$(v MTIME); nw=$(v NOW)
+	[ -n "$mt" ] && [ -n "$nw" ] && lte_age=$((nw - mt))
+	[ -n "$lte_rsrp" ] && lte_ok=1
+	lte_sim=$(v SIM | grep -oE '^[01]$')
+	grep -qs '^MODEL=' "$M" && [ $(( $(date +%s) - $(date -r "$M" +%s 2>/dev/null || echo 0) )) -le 60 ] && modem_ping=0
+fi
+
+{
+	echo "ts=$now"
+	echo "podkop=$podkop"
+	echo "modem=$modem"
+	echo "guard=$guard"
+	echo "podkop_table=$podkop_table"
+	echo "vpn_ip=$vpn_ip"
+	echo "vpn_cc=$vpn_cc"
+	echo "fakeip=$fakeip"
+	echo "vpn_ok_age=$vpn_ok_age"
+	echo "ping_ms=$ping_ms"
+	echo "modem_ping=$modem_ping"
+	echo "lte_ok=$lte_ok"
+	echo "lte_mode=$lte_mode"
+	echo "lte_rsrp=$lte_rsrp"
+	echo "lte_rsrq=$lte_rsrq"
+	echo "lte_sinr=$lte_sinr"
+	echo "lte_temp=$lte_temp"
+	echo "lte_bands=$lte_bands"
+	echo "lte_age=$lte_age"
+	echo "lte_sim=$lte_sim"
+} > "$TMP" && mv "$TMP" "$OUT"
